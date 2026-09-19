@@ -1,108 +1,135 @@
-# AgentCore Project
+# Customer Support AI Agent (Amazon Bedrock AgentCore)
 
-This project was created with the [AgentCore CLI](https://github.com/aws/agentcore-cli).
+A production-style customer support agent built on **Amazon Bedrock AgentCore** and the
+**Strands Agents SDK**. The agent answers customer questions and can track orders, process
+refunds, search a product knowledge base, calculate loyalty discounts, browse the web, and
+remember customers across sessions.
 
-## Project Structure
+The full agent implementation lives in [`main.py`](main.py).
+
+---
+
+## What the agent can do
+
+| Capability | How it works | Tool / Feature |
+|------------|--------------|----------------|
+| **Order tracking** | Looks up orders through the AgentCore Gateway (API Gateway → Lambda) | `order-tracker` gateway tools |
+| **Refund processing** | Initiates refunds and return labels through the Gateway (Lambda) | `refund-processor` gateway tools |
+| **Knowledge base search (RAG)** | Retrieves answers from a product catalog knowledge base | `search_knowledge_base` |
+| **Loyalty discount calculation** | Runs exact business-rule math in a sandbox | `calculate_loyalty_discount` (Code Interpreter) |
+| **Long-term memory** | Remembers customer facts and preferences across sessions | `MemoryHook` + AgentCore Memory |
+| **Web browsing** | Fetches a live web page and returns its title/content | `browse_web` (HTTP) / `AgentCoreBrowser` |
+
+---
+
+## Architecture
 
 ```
-my-project/
-├── AGENTS.md               # AI coding assistant context
-├── agentcore/
-│   ├── agentcore.json      # Project config (agents, memories, credentials, gateways, evaluators)
-│   ├── aws-targets.json    # Deployment targets (account + region)
-│   ├── .env.local          # Secrets — API keys (gitignored)
-│   ├── .llm-context/       # TypeScript type definitions for AI assistants
-│   │   ├── agentcore.ts    # AgentCoreProjectSpec types
-│   │   └── aws-targets.ts  # Deployment target types
-│   └── cdk/                # CDK infrastructure (@aws/agentcore-cdk)
-├── app/                    # Agent application code
-└── evaluators/             # Custom evaluator code (if any)
+Customer message
+      │
+      ▼
+┌──────────────────────────────┐
+│  @app.entrypoint  invoke()   │   AgentCore Runtime (async handler)
+│                              │
+│  1. MemoryHook: retrieve     │──► AgentCore Memory (facts + preferences)
+│     customer context         │
+│                              │
+│  2. Agent picks a tool:      │
+│     ├─ Gateway tools ────────│──► AgentCore Gateway ──► API Gateway / Lambda
+│     ├─ search_knowledge_base │──► Bedrock Knowledge Base (RAG)
+│     ├─ calculate_loyalty_... │──► Code Interpreter (sandboxed Python)
+│     └─ browse_web            │──► live web page
+│                              │
+│  3. Bedrock model (Nova)     │   composes the final answer
+│                              │
+│  4. MemoryHook: save turn    │──► AgentCore Memory
+└──────────────────────────────┘
+      │
+      ▼
+Response to customer
 ```
 
-## Getting Started
+The Bedrock model decides **which tool to call** based on each tool's docstring; the code
+just makes the tools available and wires up memory, gateway, and the runtime entrypoint.
 
-### Prerequisites
+---
 
-- **Node.js** 20.x or later
-- **Python 3.10+** and **uv** for Python agents ([install uv](https://docs.astral.sh/uv/getting-started/installation/))
-- **AWS credentials** configured (`aws configure` or environment variables)
-- **Docker** (only for Container build agents)
+## Project structure
 
-### Development
+```
+customersupportagent/
+├── main.py                 # The agent — all 8 implementation sections
+├── product_catalog.txt     # Knowledge base source (uploaded to S3)
+├── REFLECTION.md           # Engineering reflection (design, challenges, production)
+├── fix_memory.sh           # IAM helper: grant memory permissions to the agent role
+├── fix_kb.sh               # IAM helper: grant knowledge-base Retrieve permission
+├── test_gateway.py         # Standalone script to test the Gateway connection
+├── agentcore/              # AgentCore project config + CDK infrastructure
+└── screenshots/            # Functional test evidence (Tests 1–6)
+```
 
-Run your agent locally:
+---
+
+## Key implementation notes (`main.py`)
+
+1. **App init** — one `BedrockAgentCoreApp()` at module level.
+2. **Config** — `GATEWAY_URL`, `KB_ID`, `REGION`, `MEMORY_ID`.
+3. **Model + clients** — `BedrockModel` (Nova), `MemoryClient`, `bedrock-agent-runtime`.
+4. **Namespace helper** — `get_namespaces()` reads memory strategies at runtime.
+5. **Memory hook** — `retrieve_customer_context` (before) and `save_support_interaction` (after).
+6. **Knowledge base tool** — `search_knowledge_base()` calls the Bedrock Retrieve API.
+7. **Loyalty tool** — `calculate_loyalty_discount()` runs code in the Code Interpreter, with a
+   tier-only fallback if the interpreter is unavailable. Returns `points_redeemed`,
+   `tier_discount_pct`, `final_total`, `remaining_points`.
+8. **Entrypoint** — `async def invoke(payload, context=None)` connects to the Gateway, builds
+   the tool list, runs the agent, and surfaces gateway errors clearly instead of crashing.
+
+---
+
+## Running it
+
+Prerequisites: Python 3.13+, `uv`, AWS CLI v2, and the AgentCore starter toolkit. AWS
+resources (Gateway, Knowledge Base, Memory, Lambdas) must be created first, and their IDs set
+in `main.py`.
 
 ```bash
-agentcore dev
-```
+# Install dependencies
+uv sync
 
-### Validate Invocation Input
-
-Validate runtime invocation payloads before forwarding them to an agent framework. Keep user prompts typed as strings
-and pass only prompt text to the agent.
-
-### Deployment
-
-Deploy to AWS:
-
-```bash
+# Deploy to AgentCore Runtime
 agentcore deploy
+
+# Invoke the deployed agent
+agentcore invoke '{"prompt": "Can you track order ORD-001?", "customer_id": "CUST-123", "session_id": "s1"}'
+
+# View logs
+agentcore logs --since 5m
 ```
 
-## Commands
+The agent execution role also needs permissions for `bedrock-agentcore` memory actions and
+`bedrock:Retrieve` (see `fix_memory.sh` and `fix_kb.sh`).
 
-| Command | Description |
-| --- | --- |
-| `agentcore create` | Create a new AgentCore project |
-| `agentcore add` | Add resources (agent, memory, credential, gateway, evaluator, policy) |
-| `agentcore remove` | Remove resources |
-| `agentcore dev` | Run agent locally with hot-reload |
-| `agentcore deploy` | Deploy to AWS via CDK |
-| `agentcore status` | Show deployment status |
-| `agentcore invoke` | Invoke agent (local or deployed) |
-| `agentcore logs` | View agent logs |
-| `agentcore traces` | View agent traces |
-| `agentcore eval` | Run evaluations |
-| `agentcore package` | Package agent artifacts |
-| `agentcore validate` | Validate configuration |
-| `agentcore pause` | Pause a deployed agent |
-| `agentcore resume` | Resume a paused agent |
-| `agentcore fetch` | Fetch remote resource definitions |
-| `agentcore import` | Import existing resources |
-| `agentcore update` | Check for CLI updates |
+---
 
-## Configuration
+## Functional tests
 
-Edit the JSON files in `agentcore/` to configure your project. See `agentcore/.llm-context/` for type definitions and validation constraints.
+All six scenarios are verified in the `screenshots/` folder:
 
-The project uses a **flat resource model** — agents, memories, credentials, gateways, evaluators, and policies are top-level arrays in `agentcore.json`. Resources are independent; agents discover memories and credentials at runtime via environment variables or SDK calls.
+1. **Order tracking** — returns shipping status, tracking number, carrier
+2. **Refund processing** — returns refund ID, APPROVED status, credit timeline
+3. **Knowledge base (RAG)** — returns Platinum tier benefits from the catalog
+4. **Long-term memory** — recalls the customer's name and preference in a new session
+5. **Loyalty discount** — returns tier discount %, points redeemed, final total, remaining points
+6. **Web browsing** — returns the live page title from a website
 
-## Resources
+---
 
-| Resource | Purpose |
-| --- | --- |
-| Agent (runtime) | HTTP, MCP, or A2A agent deployed to AgentCore Runtime |
-| Memory | Persistent context storage with configurable strategies |
-| Credential | API key or OAuth credential providers |
-| Gateway | MCP gateway that routes tool calls to targets |
-| Gateway Target | Tool implementation (Lambda, MCP server, OpenAPI, Smithy, API Gateway) |
-| Evaluator | Custom LLM-as-a-Judge or code-based evaluation |
-| Online Eval Config | Continuous evaluation pipeline for deployed agents |
-| Policy | Cedar authorization policies for gateway tools |
+## Notable engineering challenges (see `REFLECTION.md`)
 
-### Agent Types
+- Fixed a managed-browser API mismatch (`region=` vs `region_name=`).
+- Pinned `mcp<2` to resolve a Gateway protocol validation error.
+- Added scoped IAM policies for Memory and Knowledge Base access.
+- Handled API Gateway throttling and surfaced gateway errors clearly.
+- Worked around a Playwright/anyio runtime crash with an HTTP-based browsing tool.
 
-- **Template agents**: Created from framework templates (Strands, LangChain/LangGraph, GoogleADK, OpenAI Agents, Autogen)
-- **BYO agents**: Bring your own code with `agentcore add agent --type byo`
-- **Import agents**: Import existing Bedrock agents with `agentcore import`
-
-### Build Types
-
-- **CodeZip**: Python source packaged as a zip and deployed directly to AgentCore Runtime
-- **Container**: Docker image built via CodeBuild (ARM64), pushed to ECR, and deployed to AgentCore Runtime
-
-## Documentation
-
-- [AgentCore CLI](https://github.com/aws/agentcore-cli)
-- [AgentCore CDK Constructs](https://github.com/aws/agentcore-l3-cdk-constructs)
-- [Amazon Bedrock AgentCore](https://aws.amazon.com/bedrock/agentcore/)
+Built as part of a hands-on Amazon Bedrock AgentCore project.
