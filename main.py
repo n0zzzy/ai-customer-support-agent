@@ -255,6 +255,7 @@ def calculate_loyalty_discount(
         "    'original_total': order_total,\n"
         "    'points_redeemed': points_redeemed,\n"
         "    'points_discount': points_discount,\n"
+        "    'tier_discount_pct': round(tier_rate * 100, 2),\n"
         "    'tier_discount_amount': tier_discount,\n"
         "    'final_total': final_total,\n"
         "    'total_savings': total_savings,\n"
@@ -278,16 +279,34 @@ def calculate_loyalty_discount(
     except Exception as e:
         logger.warning("Code Interpreter unavailable, using fallback: %s", e)
 
+    # Fallback path — returns the SAME required fields as the normal path:
+    # points_redeemed, tier_discount_pct, final_total, remaining_points.
+    earn_rates = {"standard": 1, "device": 2, "fresh": 5}
     tier_rates = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
     tier_rate = tier_rates.get(tier, 0.0)
-    tier_discount = round(order_total * tier_rate, 2)
-    final_total = round(order_total - tier_discount, 2)
+    earn_rate = earn_rates.get(product_category, 1)
+    max_points_dollars = order_total * 0.50
+    usable_points = min(loyalty_points, int(max_points_dollars * 100))
+    points_redeemed = (usable_points // 500) * 500
+    points_discount = points_redeemed / 100.0
+    subtotal_after_points = max(0.0, order_total - points_discount)
+    tier_discount = round(subtotal_after_points * tier_rate, 2)
+    final_total = round(subtotal_after_points - tier_discount, 2)
+    total_savings = round(points_discount + tier_discount, 2)
+    points_earned = int(final_total * earn_rate)
+    remaining_points = loyalty_points - points_redeemed + points_earned
     return json.dumps({
         "tier": tier,
         "original_total": order_total,
+        "points_redeemed": points_redeemed,
+        "points_discount": points_discount,
+        "tier_discount_pct": round(tier_rate * 100, 2),
         "tier_discount_amount": tier_discount,
         "final_total": final_total,
-        "note": "Computed with tier discount only (code interpreter unavailable).",
+        "total_savings": total_savings,
+        "points_earned": points_earned,
+        "remaining_points": remaining_points,
+        "note": "Computed locally (code interpreter unavailable).",
     })
 
 
@@ -400,7 +419,7 @@ def _wants_browser(text: str) -> bool:
 
 
 @app.entrypoint
-def invoke(payload: dict, context=None) -> dict:
+async def invoke(payload: dict, context=None) -> dict:
     user_msg = payload.get("prompt", payload.get("message", "Hello!"))
     customer_id = payload.get("customer_id", "CUST-123")
     session_id = payload.get("session_id") or str(uuid.uuid4())
@@ -421,10 +440,10 @@ def invoke(payload: dict, context=None) -> dict:
     def _create_transport():
         return streamablehttp_client(GATEWAY_URL)
 
-    # Open a fresh gateway session for this whole turn and keep it open while the
-    # agent runs. Doing the entire agent loop inside `with mcp_client:` avoids the
-    # session being torn down between tool calls (the cause of the intermittent
-    # "server URL configuration" errors on rapid repeated tool calls).
+    # Connect to the AgentCore Gateway and run the agent with all tools. Gateway
+    # failures (connection, timeout, or tool-execution errors) are caught and
+    # surfaced as a clear, non-crashing message; the agent still responds using
+    # its local tools instead of failing silently.
     try:
         mcp_client = MCPClient(_create_transport)
         with mcp_client:
@@ -437,16 +456,34 @@ def invoke(payload: dict, context=None) -> dict:
             )
             response = agent(user_msg)
             return {"response": _extract_response_text(response)}
-    except Exception as e:
-        logger.warning("Gateway unavailable, running without gateway tools: %s", e)
-        agent = Agent(
-            model=model,
-            system_prompt=SYSTEM_PROMPT,
-            tools=base_tools,
-            hooks=[memory_hook],
-        )
-        response = agent(user_msg)
-        return {"response": _extract_response_text(response)}
+    except Exception as gateway_error:
+        # Surface the gateway failure clearly, identify the failed operation,
+        # and continue with local tools so the customer still gets a response.
+        logger.error("Gateway connection/tool error: %s", gateway_error)
+        try:
+            agent = Agent(
+                model=model,
+                system_prompt=SYSTEM_PROMPT,
+                tools=base_tools,
+                hooks=[memory_hook],
+            )
+            response = agent(user_msg)
+            note = (
+                "\n\n(Note: the order/refund gateway was temporarily unavailable, "
+                "so gateway-backed lookups were skipped. Please retry shortly if you "
+                "need live order or refund details.)"
+            )
+            return {"response": _extract_response_text(response) + note}
+        except Exception as fatal_error:
+            logger.error("Agent run failed after gateway fallback: %s", fatal_error)
+            return {
+                "response": (
+                    "I'm sorry, the customer support service is temporarily "
+                    "unavailable due to a gateway connection error. Please try "
+                    "again in a few moments."
+                ),
+                "error": "gateway_unavailable: " + str(gateway_error),
+            }
 
 
 # CLI entry point
@@ -454,7 +491,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("payload", type=str)
     args = parser.parse_args()
-    response = invoke(json.loads(args.payload))
+    response = asyncio.run(invoke(json.loads(args.payload)))
     print(response)
 
 
