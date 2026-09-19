@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+setup.sh
+uv.lock
+agentcore/.cache/
+agentcore/.cli/
+agentcore/cdk/node_modules/
+agentcore/cdk/cdk.out/
+node_modules/
