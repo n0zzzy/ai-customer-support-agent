@@ -14,8 +14,8 @@ try:
 except ImportError:
     from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
 
-import argparse, json
-import os, asyncio, boto3
+import json
+import os, boto3
 from strands.hooks import (
     HookProvider, AfterInvocationEvent, HookRegistry, MessageAddedEvent,
 )
@@ -29,8 +29,8 @@ from pydantic import BaseModel, Field
 
 
 class LoyaltyDiscountResponse(BaseModel):
-    tier_discount_amount: float = Field(..., description="The calculated tier discount amount")
-    points_used: int = Field(..., description="Number of loyalty points redeemed")
+    points_redeemed: int = Field(..., description="Number of loyalty points redeemed")
+    tier_discount_pct: float = Field(..., description="The tier discount percentage applied")
     final_total: float = Field(..., description="Final order total after all discounts")
     remaining_points: int = Field(..., description="Remaining points balance after redemption")
 
@@ -279,34 +279,22 @@ def calculate_loyalty_discount(
     except Exception as e:
         logger.warning("Code Interpreter unavailable, using fallback: %s", e)
 
-    # Fallback path — returns the SAME required fields as the normal path:
-    # points_redeemed, tier_discount_pct, final_total, remaining_points.
-    earn_rates = {"standard": 1, "device": 2, "fresh": 5}
+    # Fallback path — tier-only discount when the Code Interpreter is unavailable.
+    # No points-redemption logic here (kept simple per the spec); it still returns
+    # the same required fields so downstream consumers get predictable keys.
     tier_rates = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
     tier_rate = tier_rates.get(tier, 0.0)
-    earn_rate = earn_rates.get(product_category, 1)
-    max_points_dollars = order_total * 0.50
-    usable_points = min(loyalty_points, int(max_points_dollars * 100))
-    points_redeemed = (usable_points // 500) * 500
-    points_discount = points_redeemed / 100.0
-    subtotal_after_points = max(0.0, order_total - points_discount)
-    tier_discount = round(subtotal_after_points * tier_rate, 2)
-    final_total = round(subtotal_after_points - tier_discount, 2)
-    total_savings = round(points_discount + tier_discount, 2)
-    points_earned = int(final_total * earn_rate)
-    remaining_points = loyalty_points - points_redeemed + points_earned
+    tier_discount = round(order_total * tier_rate, 2)
+    final_total = round(order_total - tier_discount, 2)
     return json.dumps({
         "tier": tier,
         "original_total": order_total,
-        "points_redeemed": points_redeemed,
-        "points_discount": points_discount,
+        "points_redeemed": 0,
         "tier_discount_pct": round(tier_rate * 100, 2),
         "tier_discount_amount": tier_discount,
         "final_total": final_total,
-        "total_savings": total_savings,
-        "points_earned": points_earned,
-        "remaining_points": remaining_points,
-        "note": "Computed locally (code interpreter unavailable).",
+        "remaining_points": loyalty_points,
+        "note": "Tier-only discount (code interpreter unavailable).",
     })
 
 
@@ -457,10 +445,44 @@ async def invoke(payload: dict, context=None) -> dict:
             response = agent(user_msg)
             return {"response": _extract_response_text(response)}
     except Exception as gateway_error:
-        # Surface the gateway failure clearly, identify the failed operation,
-        # and continue with local tools so the customer still gets a response.
-        logger.error("Gateway connection/tool error: %s", gateway_error)
+        # Surface the gateway failure clearly. Distinguish a transient error
+        # (timeout/connection reset -> worth retrying) from a likely permanent
+        # one (auth/not-found -> retry will not help), and explicitly tell the
+        # customer which specific capabilities are unavailable so they are not
+        # misled into thinking a gateway lookup succeeded.
+        err_text = str(gateway_error).lower()
+        transient_markers = ("timeout", "timed out", "connection", "reset",
+                             "unavailable", "throttl", "429", "503", "502")
+        is_transient = any(m in err_text for m in transient_markers)
+
+        logger.error(
+            "Gateway error (%s): %s",
+            "transient" if is_transient else "non-transient",
+            gateway_error,
+        )
+
+        unavailable_notice = (
+            "\n\n---\n"
+            "Service notice: The support gateway is currently unreachable, so the "
+            "following gateway-backed actions are UNAVAILABLE right now and were NOT "
+            "attempted: order tracking (get_order / get_customer_orders / get_customer) "
+            "and refund processing (initiate_refund / check_refund_status / "
+            "get_return_label). "
+        )
+        if is_transient:
+            unavailable_notice += (
+                "This looks like a temporary connectivity issue - please try again "
+                "in a few moments."
+            )
+        else:
+            unavailable_notice += (
+                "This may be a configuration or authorization issue - please contact "
+                "support if it persists."
+            )
+
         try:
+            # Continue with local tools only (knowledge base, loyalty, browsing)
+            # so the customer still receives a helpful response.
             agent = Agent(
                 model=model,
                 system_prompt=SYSTEM_PROMPT,
@@ -468,36 +490,19 @@ async def invoke(payload: dict, context=None) -> dict:
                 hooks=[memory_hook],
             )
             response = agent(user_msg)
-            note = (
-                "\n\n(Note: the order/refund gateway was temporarily unavailable, "
-                "so gateway-backed lookups were skipped. Please retry shortly if you "
-                "need live order or refund details.)"
-            )
-            return {"response": _extract_response_text(response) + note}
+            return {"response": _extract_response_text(response) + unavailable_notice}
         except Exception as fatal_error:
             logger.error("Agent run failed after gateway fallback: %s", fatal_error)
             return {
                 "response": (
                     "I'm sorry, the customer support service is temporarily "
-                    "unavailable due to a gateway connection error. Please try "
+                    "unavailable due to a gateway connection error. Order tracking "
+                    "and refund processing cannot be performed right now. Please try "
                     "again in a few moments."
                 ),
                 "error": "gateway_unavailable: " + str(gateway_error),
             }
 
 
-# CLI entry point
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("payload", type=str)
-    args = parser.parse_args()
-    response = asyncio.run(invoke(json.loads(args.payload)))
-    print(response)
-
-
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        main()
-    else:
-        app.run()
+    app.run()
