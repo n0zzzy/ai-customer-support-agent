@@ -7,6 +7,9 @@ remember customers across sessions.
 
 The full agent implementation lives in [`main.py`](main.py).
 
+
+<p align="center"><img src="docs/architecture.svg" alt="Architecture diagram" width="100%"/></p>
+
 ---
 
 ## What the agent can do
